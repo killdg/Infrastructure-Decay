@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <TargetFramework>net8.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+    </PropertyGroup>
+    <ItemGroup>
+        <Compile Include="../src/Client/OutageSchedule.cs" Link="OutageSchedule.cs" />
+        <Compile Include="../src/Client/PowerFlickerPatterns.cs" Link="PowerFlickerPatterns.cs" />
+        <Reference Include="Mono.Cecil">
+            <HintPath>$(SPTPath)/BepInEx/core/Mono.Cecil.dll</HintPath>
+        </Reference>
+    </ItemGroup>
+</Project>

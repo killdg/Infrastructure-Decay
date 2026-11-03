@@ -1,0 +1,7 @@
+**/bin/
+**/obj/
+artifacts/
+*.log
+verification-*.txt
+package-*.txt
+!docs/verification.txt
