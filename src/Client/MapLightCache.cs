@@ -105,11 +105,42 @@ namespace InfrastructureDecay
             }
         }
 
-        private readonly List<ITarget> targets = new();
+        private readonly struct Entry
+        {
+            internal Entry(ITarget target, LightSourceGroup group)
+            {
+                Target = target;
+                Group = group;
+            }
+
+            internal ITarget Target { get; }
+            internal LightSourceGroup Group { get; }
+        }
+
+        // Light outputs (a few thousand) are cheap scalar reads and can be
+        // overridden by native flicker every frame, so they are driven every
+        // LateUpdate. Material slots are far more numerous (Streets: ~90k) and
+        // each check costs several native property-block calls, so they are
+        // driven by a time-budgeted sweep instead of a full pass per frame.
+        private readonly List<Entry> lightTargets = new();
+        private readonly List<Entry> slotTargets = new();
         private readonly HashSet<int> ids = new();
         private readonly HashSet<int> drivenLights = new();
         private readonly HashSet<string> materialSlots = new HashSet<string>();
-        private readonly Dictionary<ITarget, LightSourceGroup> groups = new Dictionary<ITarget, LightSourceGroup>();
+        private readonly MaterialPropertyBlock probe = new MaterialPropertyBlock();
+        private readonly float[] groupGains = new float[8];
+        private readonly Stopwatch sweepClock = new Stopwatch();
+        private int darkSlotsSkipped;
+
+        // Sweep state for material slots.
+        private const int SteadySlotsPerFrame = 512;
+        private const double ChangeBudgetMilliseconds = 2.0;
+        private const float GlowThreshold = 0.0001f;
+        private bool groupMode;
+        private float driveGain = 1;
+        private bool dimmed;
+        private int sweepCursor;
+        private int sweepLeft;
         private readonly Stack<Transform> pending = new();
         private readonly HashSet<int> scenes = new();
         private readonly MapMaterialSurvey materialSurvey = new MapMaterialSurvey();
@@ -183,7 +214,9 @@ namespace InfrastructureDecay
 
             if (pending.Count == 0)
             {
-                Plugin.Trace($"[ID-LIGHTS] cache-ready nodes={nodes} lamps={lamps} controllableOutputs={targets.Count}; map lights only");
+                Plugin.Trace($"[ID-LIGHTS] cache-ready nodes={nodes} lamps={lamps} controllableOutputs={OutputCount} "
+                    + $"(lights={lightTargets.Count} glowingSlots={slotTargets.Count} darkSlotsSkipped={darkSlotsSkipped}); "
+                    + "map lights only");
             }
         }
 
@@ -205,21 +238,20 @@ namespace InfrastructureDecay
         {
             if (ids.Add(target.Id))
             {
-                targets.Add(target);
-                groups.Add(target, group);
+                lightTargets.Add(new Entry(target, group));
             }
         }
 
         private void Driven(int id)
         {
             drivenLights.Add(id);
-            for (int i = targets.Count - 1; i >= 0; i--)
+            // Only light outputs carry Light instance ids; material slots never match.
+            for (int i = lightTargets.Count - 1; i >= 0; i--)
             {
-                if (targets[i].Id == id)
+                if (lightTargets[i].Target.Id == id)
                 {
-                    targets[i].Restore();
-                    groups.Remove(targets[i]);
-                    targets.RemoveAt(i);
+                    lightTargets[i].Target.Restore();
+                    lightTargets.RemoveAt(i);
                     ids.Remove(id);
                 }
             }
@@ -326,26 +358,36 @@ namespace InfrastructureDecay
                 return;
             }
 
+            // Lamp fixture slots stay registered even while dark: the lamp can be
+            // switched on later, and its glow must then follow the outage.
             RegisterMaterialSlots(
                 entry.Renderer,
-                entry is MaterialColor colorEntry ? colorEntry.ParemeterName : null);
+                entry is MaterialColor colorEntry ? colorEntry.ParemeterName : null,
+                fixture: true);
         }
 
-        internal int OutputCount => targets.Count;
+        internal int OutputCount => lightTargets.Count + slotTargets.Count;
+
+        // True when no output is dimmed and no restoring sweep is pending.
+        internal bool Idle => !dimmed && sweepLeft == 0;
 
         internal string DescribeGroups()
         {
-            var counts = new Dictionary<LightSourceGroup, int>();
-            foreach (LightSourceGroup group in groups.Values)
+            var counts = new int[groupGains.Length];
+            foreach (Entry entry in lightTargets)
             {
-                counts[group] = counts.TryGetValue(group, out int count) ? count + 1 : 1;
+                counts[(int)entry.Group]++;
+            }
+
+            foreach (Entry entry in slotTargets)
+            {
+                counts[(int)entry.Group]++;
             }
 
             var descriptions = new List<string>();
             foreach (LightSourceGroup group in Enum.GetValues(typeof(LightSourceGroup)))
             {
-                counts.TryGetValue(group, out int count);
-                descriptions.Add(group + "=" + count);
+                descriptions.Add(group + "=" + counts[(int)group]);
             }
 
             return string.Join("; ", descriptions);
@@ -353,53 +395,139 @@ namespace InfrastructureDecay
 
         internal void Drive(float gain, Func<LightSourceGroup, float>? groupGain = null)
         {
-            for (int index = targets.Count - 1; index >= 0; index--)
+            // Resolve the requested state once per frame and detect a change.
+            bool changed;
+            if (groupGain == null)
+            {
+                changed = groupMode || gain != driveGain;
+                groupMode = false;
+                driveGain = gain;
+                dimmed = gain < 1;
+            }
+            else
+            {
+                changed = !groupMode;
+                groupMode = true;
+                dimmed = false;
+                for (int index = 0; index < groupGains.Length; index++)
+                {
+                    float value = groupGain((LightSourceGroup)index);
+                    changed |= value != groupGains[index];
+                    groupGains[index] = value;
+                    dimmed |= value < 1;
+                }
+            }
+
+            for (int index = lightTargets.Count - 1; index >= 0; index--)
+            {
+                DriveEntry(lightTargets, index);
+            }
+
+            // A state change (flicker edge, outage start or end) sweeps every
+            // slot once within a per-frame time budget, continuing next frame if
+            // needed. While the state is steady, a small rolling share is
+            // re-asserted so native emission changes are adopted or re-darkened.
+            if (changed)
+            {
+                sweepLeft = slotTargets.Count;
+            }
+
+            int steady = Math.Min(SteadySlotsPerFrame, slotTargets.Count);
+            int processed = 0;
+            sweepClock.Restart();
+            while (slotTargets.Count > 0)
+            {
+                if (sweepLeft > 0)
+                {
+                    if (processed > 0 && processed % 64 == 0
+                        && sweepClock.Elapsed.TotalMilliseconds >= ChangeBudgetMilliseconds)
+                    {
+                        break;
+                    }
+
+                    sweepLeft--;
+                }
+                else if (steady-- <= 0)
+                {
+                    break;
+                }
+
+                if (sweepCursor >= slotTargets.Count)
+                {
+                    sweepCursor = 0;
+                }
+
+                if (DriveEntry(slotTargets, sweepCursor))
+                {
+                    sweepCursor++;
+                }
+
+                processed++;
+            }
+        }
+
+        private float GainFor(LightSourceGroup group)
+        {
+            if (groupMode)
+            {
+                return groupGains[(int)group];
+            }
+
+            return group == LightSourceGroup.ExperimentalUnlitScreens ? 1 : driveGain;
+        }
+
+        // Returns false when the entry was removed from the list.
+        private bool DriveEntry(List<Entry> list, int index)
+        {
+            Entry entry = list[index];
+            try
+            {
+                float selectedGain = GainFor(entry.Group);
+                if (selectedGain >= 1)
+                {
+                    entry.Target.Restore();
+                }
+                else
+                {
+                    entry.Target.Apply(selectedGain);
+                }
+
+                return true;
+            }
+            catch (Exception error)
             {
                 try
                 {
-                    LightSourceGroup group = groups[targets[index]];
-                    if (groupGain == null && group == LightSourceGroup.ExperimentalUnlitScreens)
-                    {
-                        targets[index].Restore();
-                    }
-                    else
-                    {
-                        float selectedGain = groupGain == null ? gain : groupGain(group);
-                        if (selectedGain >= 1)
-                        {
-                            targets[index].Restore();
-                        }
-                        else
-                        {
-                            targets[index].Apply(selectedGain);
-                        }
-                    }
+                    entry.Target.Restore();
                 }
-                catch (Exception error)
+                catch
                 {
-                    try
-                    {
-                        targets[index].Restore();
-                    }
-                    catch
-                    {
-                        // An unloaded scene output cannot be restored.
-                    }
-                    ids.Remove(targets[index].Id);
-                    groups.Remove(targets[index]);
-                    targets.RemoveAt(index);
-                    Plugin.Trace("[ID-LIGHTS] unavailable output removed: " + error.GetBaseException().Message);
+                    // An unloaded scene output cannot be restored.
                 }
+                ids.Remove(entry.Target.Id);
+                list.RemoveAt(index);
+                Plugin.Trace("[ID-LIGHTS] unavailable output removed: " + error.GetBaseException().Message);
+                return false;
             }
         }
 
         internal void Restore()
         {
-            foreach (var target in targets)
+            RestoreAll(lightTargets);
+            RestoreAll(slotTargets);
+            groupMode = false;
+            driveGain = 1;
+            dimmed = false;
+            sweepLeft = 0;
+        }
+
+        private static void RestoreAll(List<Entry> list)
+        {
+            foreach (Entry entry in list)
             {
                 try
                 {
-                    target.Restore();
+                    entry.Target.Restore();
                 }
                 catch (Exception error)
                 {
@@ -415,11 +543,13 @@ namespace InfrastructureDecay
                 SceneManager.sceneLoaded -= SceneLoaded;
             }
 
-            targets.Clear();
+            lightTargets.Clear();
+            slotTargets.Clear();
             ids.Clear();
             drivenLights.Clear();
             materialSlots.Clear();
-            groups.Clear();
+            sweepCursor = 0;
+            darkSlotsSkipped = 0;
             pending.Clear();
             scenes.Clear();
             materialSurvey.Reset();
