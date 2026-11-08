@@ -15,7 +15,7 @@ namespace InfrastructureDecay
 {
     [DefaultExecutionOrder(10010)]
     [BepInDependency(DeveloperSettings.PluginId, BepInDependency.DependencyFlags.SoftDependency)]
-    [BepInPlugin("com.killdg.infrastructuredecay", "Infrastructure Decay", "1.0.6")]
+    [BepInPlugin("com.killdg.infrastructuredecay", "Infrastructure Decay", "1.0.6.1")]
     public sealed class Plugin : BaseUnityPlugin
     {
         private static Plugin? instance;
@@ -56,6 +56,7 @@ namespace InfrastructureDecay
         private readonly Dictionary<LightSourceGroup, ConfigEntry<bool>> sourceTests =
             new Dictionary<LightSourceGroup, ConfigEntry<bool>>();
         private bool testingSources;
+        private Func<LightSourceGroup, float>? sourceTestGain;
         private float nextSourceStatus;
 
         internal static bool PowerOut => instance?.controlling == true && !instance.testingSources
@@ -153,10 +154,11 @@ namespace InfrastructureDecay
                 "Named unlit screen materials exposing a color tint. Diagnostic only; excluded from automatic "
                     + "outages. May not cover every projection/video shader.");
             ClearSourceTests();
+            sourceTestGain = group => sourceTests[group].Value ? 0 : 1;
 
             ResolveRouletteLighting();
             harmony.PatchAll(typeof(Plugin).Assembly);
-            Logger.LogInfo("Infrastructure Decay 1.0.6 loaded. Local client only; no network access. F1 opens settings.");
+            Logger.LogInfo("Infrastructure Decay 1.0.6.1 loaded. Local client only; no network access. F1 opens settings.");
         }
 
         private void ResolveRouletteLighting()
@@ -313,10 +315,8 @@ namespace InfrastructureDecay
                         schedule.Start(now, flickerSeconds);
                     }
                 }
-                else
-                {
-                    lights.Restore();
-                }
+                // Power return is restored by LateUpdate through the same
+                // time-budgeted sweep, avoiding a full restore pass in one frame.
                 Logger.LogInfo($"[ID-POWER] active={schedule.Active} recoveredSurge={recoveredSurge} "
                     + $"pattern={pattern + 1} outputs={lights.OutputCount} "
                     + $"remaining={Math.Max(0, schedule.Ends - now):0}s");
@@ -335,12 +335,16 @@ namespace InfrastructureDecay
 
             if (testingSources)
             {
-                lights.Drive(1, group => sourceTests[group].Value ? 0 : 1);
+                lights.Drive(1, sourceTestGain);
                 return;
             }
 
             if (!schedule.Active)
             {
+                if (!lights.Idle)
+                {
+                    lights.Drive(1);
+                }
                 return;
             }
             var game = Singleton<AbstractGame>.Instance;

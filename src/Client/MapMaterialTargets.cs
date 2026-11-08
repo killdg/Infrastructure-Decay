@@ -150,7 +150,7 @@ namespace InfrastructureDecay
             }
         }
 
-        private void RegisterMaterialSlots(Renderer renderer, string? customColor = null)
+        private void RegisterMaterialSlots(Renderer renderer, string? customColor = null, bool fixture = false)
         {
             Material[] materials = renderer.sharedMaterials;
             for (int slot = 0; slot < materials.Length; slot++)
@@ -205,11 +205,57 @@ namespace InfrastructureDecay
                     continue;
                 }
 
+                // Most map materials expose an emission channel that is black or
+                // switched off. Scaling zero changes nothing on screen, but every
+                // such slot would still cost native property-block calls on each
+                // drive and an indexed block override during outages. Lamp fixture
+                // slots are kept regardless, because their glow is switchable.
+                // The key is not recorded, so a lamp found later can still claim it.
+                if (!fixture && !Glows(renderer, material, slot, property, color))
+                {
+                    darkSlotsSkipped++;
+                    continue;
+                }
+
                 materialSlots.Add(key);
                 ITarget target = new MaterialSlotTarget(renderer, material, slot, property, color);
-                targets.Add(target);
-                groups.Add(target, group);
+                slotTargets.Add(new Entry(target, group));
             }
+        }
+
+        // Effective value as rendered: indexed slot block, then renderer-wide
+        // block, then the shared material. Discovery-time only.
+        private bool Glows(Renderer renderer, Material material, int slot, int property, bool color)
+        {
+            renderer.GetPropertyBlock(probe, slot);
+            if (TryReadGlow(probe, property, color, out bool glows))
+            {
+                return glows;
+            }
+
+            renderer.GetPropertyBlock(probe);
+            if (TryReadGlow(probe, property, color, out glows))
+            {
+                return glows;
+            }
+
+            return color
+                ? material.GetColor(property).maxColorComponent > GlowThreshold
+                : material.GetFloat(property) > GlowThreshold;
+        }
+
+        private static bool TryReadGlow(MaterialPropertyBlock block, int property, bool color, out bool glows)
+        {
+            if (color ? block.HasColor(property) : block.HasFloat(property))
+            {
+                glows = color
+                    ? block.GetColor(property).maxColorComponent > GlowThreshold
+                    : block.GetFloat(property) > GlowThreshold;
+                return true;
+            }
+
+            glows = false;
+            return false;
         }
 
         private static bool IsDisplayName(string name)
